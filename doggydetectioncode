@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import Bool, String
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+from typing import Optional
+
+# code for detecting dogs
+# model still needs to be inputted
+# can use yolo or pre-trained model from jacky?
+
+class DogDetector(Node):
+    def __init__(self):
+        super().__init__("dog_detector")
+        self.declare_parameter("confidence_threshold", 0.5) # if we're above, we just say we've found a dog, otherwise no 
+        self.declare_parameter("model_path", "")  
+        self.declare_parameter("detection_cooldown", 2.0)  # seconds before each detection (can adjust as we need, just for demo)
+        self.bridge = CvBridge()
+        self.last_detection_time = 0.0
+        self.model = None # we would have to put some model here.
+        self.class_names = []
+        
+        self.initialize_model()
+        self.image_sub = self.create_subscription(
+            Image, 
+            "/camera/image_raw", 
+            self.image_callback, 
+            10
+        )
+        self.detection_pub = self.create_publisher(Bool, "/dog_detected", 10)
+        self.detection_info_pub = self.create_publisher(String, "/dog_detection_info", 10)
+        self.annotated_image_pub = self.create_publisher(Image, "/dog_detector/annotated_image", 10)
+        self.get_logger().info("we have initialized the dog detector node")
+    
+    def initialize_model(self):
+        try:
+            # if we want to use YOLO
+            # Download weights: https://github.com/AlexeyAB/darknet/releases/download/darknet_yolo_v4_pre/yolov4-tiny.weights
+            # Download config: https://github.com/AlexeyAB/darknet/blob/master/cfg/yolov4-tiny.cfg
+            model_path = self.get_parameter("model_path").value
+            if not model_path:
+                self.get_logger().warn("No model path specified. Using placeholder detection.")
+                return
+            
+            self.net = cv2.dnn.readNet(
+                f"{model_path}/yolov4-tiny.weights",
+                f"{model_path}/yolov4-tiny.cfg"
+            )
+            with open(f"{model_path}/coco.names", "r") as f:
+                self.class_names = [line.strip() for line in f.readlines()]
+            
+            layer_names = self.net.getLayerNames()
+            self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+            
+            self.get_logger().info("Model loaded successfully")
+        except Exception as e:
+            self.get_logger().error(f"model did not load")
+            self.get_logger().warn("we need the detector!")
+    
+    def detect_objects(self, image: np.ndarray) -> tuple:
+        if self.net is None:
+            return self.placeholder_detection(image)
+        height, width = image.shape[:2]
+        blob = cv2.dnn.blobFromImage(image, 1/255.0, (416, 416), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outputs = self.net.forward(self.output_layers)
+        class_ids = []
+        confidences = []
+        boxes = []
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > self.get_parameter("confidence_threshold").value:
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+        if len(indices) > 0:
+            indices = indices.flatten()
+            return (
+                [class_ids[i] for i in indices],
+                [confidences[i] for i in indices],
+                [boxes[i] for i in indices]
+            )
+        return [], [], []
+    
+    def placeholder_detection(self, image: np.ndarray) -> tuple:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower_brown = np.array([10, 50, 50])
+        upper_brown = np.array([30, 255, 200])
+        mask = cv2.inRange(hsv, lower_brown, upper_brown)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        confidences = []
+        class_ids = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > 5000:  
+                x, y, w, h = cv2.boundingRect(contour)
+                boxes.append([x, y, w, h])
+                confidences.append(0.7) 
+                class_ids.append(16)  
+        return class_ids, confidences, boxes
+    
+    def image_callback(self, msg: Image):
+        try:
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            class_ids, confidences, boxes = self.detect_objects(cv_image)
+            dog_detected = False
+            dog_count = 0
+            for i, class_id in enumerate(class_ids):
+                if self.class_names and self.class_names[class_id] == "dog":
+                    dog_detected = True
+                    dog_count += 1
+                elif class_id == 16:  
+                    dog_detected = True
+                    dog_count += 1
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            cooldown = self.get_parameter("detection_cooldown").value
+            
+            if dog_detected and (current_time - self.last_detection_time) > cooldown:
+                self.last_detection_time = current_time
+                detection_msg = Bool()
+                detection_msg.data = True
+                self.detection_pub.publish(detection_msg)
+                
+                info_msg = String()
+                info_msg.data = f"Detected {dog_count} dog(s) with confidences: {confidences[:dog_count]}"
+                self.detection_info_pub.publish(info_msg)
+                
+                self.get_logger().info(f"Dog detected! Count: {dog_count}")
+            
+            annotated_image = self.annotate_image(cv_image, class_ids, confidences, boxes)
+            annotated_msg = self.bridge.cv2_to_imgmsg(annotated_image, encoding="bgr8")
+            self.annotated_image_pub.publish(annotated_msg)
+            
+        except Exception as e:
+            self.get_logger().error(f"Error processing image: {e}")
+    
+    def annotate_image(self, image: np.ndarray, class_ids: list, 
+                       confidences: list, boxes: list) -> np.ndarray:
+        annotated = image.copy()
+        
+        for i, box in enumerate(boxes):
+            x, y, w, h = box
+            is_dog = (self.class_names and self.class_names[class_ids[i]] == "dog") or class_ids[i] == 16
+            color = (0, 0, 255) if is_dog else (0, 255, 0)
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
+            label = f"{self.class_names[class_ids[i]] if self.class_names else 'object'}: {confidences[i]:.2f}"
+            cv2.putText(annotated, label, (x, y - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        return annotated
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = DogDetector()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
